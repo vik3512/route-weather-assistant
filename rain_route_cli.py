@@ -1,318 +1,368 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import os
-import requests
-import polyline
-from datetime import datetime, timedelta
+from urllib.parse import urlencode, quote_plus
+from datetime import datetime, timedelta, timezone
+
+import requests, polyline
 from dotenv import load_dotenv
 import streamlit as st
 
-# ================= 靈敏度設定（維持高敏感） =================
+# ======================== 常數與參數 ========================
+SAMPLES_FAST     = 8     # 快掃：決定要不要畫地圖
+SAMPLES_NORMAL   = 14    # 繪圖：分段採樣點
+SHOW_MAP_RISK_THRESHOLD = 0.20
 OPEN_WEATHER_MIN_RAIN_MM = 0.0
-OPEN_METEO_MIN_RAIN_MM   = 0.0
-OPEN_METEO_NEXT_HOUR_PROB_THRESHOLD = 30
-MAX_SAMPLE_POINTS = 16
-# ===========================================================
 
-# ---------- 載入環境變數 ----------
+# 顏色（Google Static Maps RGBA）
+COLOR_GREEN = "0x00AA00FF"   # 推薦路線無雨段
+COLOR_BLUE  = "0x0066CCFF"   # 任一路線有雨段
+COLOR_GRAY  = "0x999999FF"   # 其他候選基底
+
+# 風險評分
+RAIN_RATIO_WEIGHT = 0.7
+RAIN_INTENSITY_WEIGHT = 0.3  # 以 30 mm/h 正規化
+# =========================================================
+
 load_dotenv()
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+# 支援本機 .env 與 Streamlit Cloud 的 st.secrets
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY") or st.secrets.get("GOOGLE_MAPS_API_KEY", "")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY") or st.secrets.get("OPENWEATHER_API_KEY", "")
 
-# ---------- 地址 → place_id ----------
-def resolve_place(query: str):
-    if not GOOGLE_MAPS_API_KEY:
-        return None, None
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {
-        "address": query, "key": GOOGLE_MAPS_API_KEY,
-        "language": "zh-TW", "region": "tw", "components": "country:TW",
-    }
-    resp = requests.get(url, params=params, timeout=20).json()
-    if resp.get("status") == "OK" and resp.get("results"):
-        top = resp["results"][0]
-        return f"place_id:{top['place_id']}", top.get("formatted_address", query)
-    return None, None
-
-# ---------- 座標 → 行政區｜主要幹道路名 ----------
-def reverse_geocode_district_and_road(lat: float, lon: float) -> str:
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"latlng": f"{lat},{lon}", "key": GOOGLE_MAPS_API_KEY, "language": "zh-TW", "region": "tw"}
-    resp = requests.get(url, params=params, timeout=20).json()
-    if resp.get("status") != "OK" or not resp.get("results"):
-        return f"{lat:.4f},{lon:.4f}"
-
-    best_admin3 = best_locality = best_admin2 = best_route = None
-    for res in resp.get("results", []):
-        for c in res.get("address_components", []):
-            t = c.get("types", [])
-            if "route" in t and not best_route:
-                best_route = c.get("long_name")
-            if "administrative_area_level_3" in t and not best_admin3:
-                best_admin3 = c.get("long_name")
-            if "locality" in t and not best_locality:
-                best_locality = c.get("long_name")
-            if "administrative_area_level_2" in t and not best_admin2:
-                best_admin2 = c.get("long_name")
-    district = best_admin3 or best_locality or best_admin2
-    if district and best_route:
-        return f"{district}｜{best_route}"
-    if district:
-        return district
-    return resp["results"][0].get("formatted_address", f"{lat:.4f},{lon:.4f}")
-
-# ---------- 路線規劃 ----------
-def get_route_from_place_ids(origin_pid: str, dest_pid: str, mode: str = "driving"):
-    if not GOOGLE_MAPS_API_KEY:
-        raise Exception("缺少 GOOGLE_MAPS_API_KEY")
-    url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": origin_pid, "destination": dest_pid, "mode": mode,
-        "key": GOOGLE_MAPS_API_KEY, "language": "zh-TW", "region": "tw",
-    }
-    if mode == "transit":
-        params["departure_time"] = "now"
-    resp = requests.get(url, params=params, timeout=30).json()
-    status = resp.get("status")
-    if status == "ZERO_RESULTS":
-        raise Exception("找不到路線，請更換交通方式或地址")
-    if status == "REQUEST_DENIED":
-        raise Exception(f"API 被拒絕: {resp.get('error_message', '')}")
-    if status != "OK":
-        raise Exception(f"API 錯誤: {status}")
-    route = resp["routes"][0]
-    coords = polyline.decode(route["overview_polyline"]["points"])
-    leg = route["legs"][0]
-    duration_sec = leg["duration"]["value"]
-    arrival_time = datetime.now() + timedelta(seconds=duration_sec)
-    return coords, duration_sec, arrival_time, leg["start_address"], leg["end_address"]
-
-# ---------- OpenWeather：即時 ----------
-def ow_current(lat, lon):
-    """回傳 (desc, is_rain, rain_mm_1h)"""
-    if not OPENWEATHER_API_KEY:
-        raise Exception("缺少 OPENWEATHER_API_KEY")
-    url = "https://api.openweathermap.org/data/2.5/weather"
-    params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"}
-    resp = requests.get(url, params=params, timeout=20).json()
-    if "weather" not in resp:
-        return f"查詢失敗：{resp.get('message', 'unknown')}", False, 0.0
-    weather = resp["weather"][0]
-    desc = weather.get("description", "") or "無資料"
-    main_lower = weather.get("main", "").lower()
-    desc_lower = desc.lower()
-    rain_mm = 0.0
-    if isinstance(resp.get("rain"), dict):
-        rain_mm = float(resp["rain"].get("1h") or resp["rain"].get("3h") or 0.0)
-    is_rain = (
-        (rain_mm > OPEN_WEATHER_MIN_RAIN_MM)
-        or ("rain" in main_lower) or ("雨" in desc_lower)
-        or ("雷陣雨" in desc_lower) or ("毛毛雨" in desc_lower)
-        or ("陣雨" in desc_lower) or ("濛濛雨" in desc_lower) or ("小雨" in desc_lower)
-    )
-    return desc, is_rain, rain_mm
-
-# ---------- OpenWeather：預估多久雨停（3h 粒度） ----------
-def ow_forecast_rain_stop_hours(lat, lon):
-    """回傳：預估幾小時後雨停（None 表示找不到持續雨段或無法估算）"""
-    url = "https://api.openweathermap.org/data/2.5/forecast"
-    params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"}
-    resp = requests.get(url, params=params, timeout=20).json()
-    if "list" not in resp:
-        return None
-    now = datetime.now()
-    rain_hours = 0
-    for item in resp["list"]:
-        t = datetime.fromtimestamp(item["dt"])
-        if t < now:
-            continue
-        w = item["weather"][0]
-        desc = w.get("description", "").lower()
-        main = w.get("main", "").lower()
-        rain_mm = 0.0
-        if isinstance(item.get("rain"), dict):
-            rain_mm = float(item["rain"].get("3h") or item["rain"].get("1h") or 0.0)
-        is_rain = (rain_mm > 0) or ("rain" in main) or ("雨" in desc)
-        if is_rain:
-            rain_hours += 3
-        else:
-            break
-    return rain_hours if rain_hours > 0 else None
-
-# ---------- Open-Meteo：即時 + 下一小時機率 + code ----------
-def om_now_prob_precip_code(lat, lon):
-    """
-    回傳 (is_rain_now, prob_next_percent, current_precip_mm, weather_code_now)
-    """
-    base = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat, "longitude": lon,
-        "current": "precipitation,weather_code",
-        "hourly": "precipitation_probability,precipitation,weather_code",
-        "forecast_days": 1, "timezone": "auto",
-    }
-    resp = requests.get(base, params=params, timeout=20).json()
-
-    def code_is_rain(code: int) -> bool:
-        return (51 <= code <= 67) or (80 <= code <= 99)
-
-    cur = resp.get("current", {})
-    cur_prec = float(cur.get("precipitation", 0.0) or 0.0)
-    cur_code = int(cur.get("weather_code") or 0)
-    is_now = (cur_prec > OPEN_METEO_MIN_RAIN_MM) or code_is_rain(cur_code)
-
-    hourly = resp.get("hourly", {})
-    prob_list = hourly.get("precipitation_probability", []) or []
-    prob_next = int(prob_list[0]) if prob_list else 0
-
-    return is_now, prob_next, cur_prec, cur_code
-
-# ---------- 用語分級（直觀版） ----------
-def classify_rain_phrase(mm_per_hr: float, prob_next: int, weather_code_now: int) -> str:
-    """
-    文字用語優先序：
-      1) 95–99 → 雷陣雨
-      2) mm ≥ 30 → 豪雨
-      3) 15 ≤ mm < 30 → 大雨
-      4) 7 ≤ mm < 15 → 陣雨（較大）
-      5) 2 ≤ mm < 7 → 陣雨
-      6) 0 < mm < 2 → 短暫陣雨
-      7) mm == 0 且 機率 ≥ 50% → 短暫陣雨（可能）
-      8) 其餘 → 無降雨
-    """
-    if 95 <= weather_code_now <= 99:
-        return "雷陣雨"
-    if mm_per_hr >= 30:
-        return "豪雨"
-    if mm_per_hr >= 15:
-        return "大雨"
-    if mm_per_hr >= 7:
-        return "陣雨（較大）"
-    if mm_per_hr >= 2:
-        return "陣雨"
-    if mm_per_hr > 0:
-        return "短暫陣雨"
-    if prob_next >= 50:
-        return "短暫陣雨（可能）"
-    return "無降雨"
-
-# ---------- 沿途：現在是否下雨（共識） ----------
-def is_rain_now_consensus(lat, lon):
-    _, ow_now, ow_mm = ow_current(lat, lon)
-    try:
-        om_now, _, _, _ = om_now_prob_precip_code(lat, lon)
-    except Exception:
-        om_now = False
-    return ow_now or (ow_mm > OPEN_WEATHER_MIN_RAIN_MM) or om_now
-
-# ========== Streamlit UI ==========
+# ======================== UI 基本設定 ========================
 st.set_page_config(page_title="路線天氣助手", page_icon="🌦", layout="centered")
 st.title("🌦 路線天氣助手")
 
-# 金鑰檢查
-if not GOOGLE_MAPS_API_KEY or not OPENWEATHER_API_KEY:
-    st.error("⚠️ 請先在 `.env` 檔設定 GOOGLE_MAPS_API_KEY 與 OPENWEATHER_API_KEY")
-    st.stop()
+# 乾淨 UI：不顯示任何歷史/重置說明文字
+st.markdown(
+    """
+    <style>
+    div.stTextInput > label, div.stSelectbox > label { margin-bottom: 6px !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# seed 與狀態
-if "reset_seed" not in st.session_state:
-    st.session_state.reset_seed = 0
-if "query_done" not in st.session_state:
-    st.session_state.query_done = False
+# ======================== 強力重置：nonce 機制 ========================
+if "ui_nonce" not in st.session_state:
+    st.session_state["ui_nonce"] = 0
 
-# 動態 keys
-origin_key = f"origin_{st.session_state.reset_seed}"
-dest_key   = f"dest_{st.session_state.reset_seed}"
-mode_key   = f"mode_{st.session_state.reset_seed}"
+def hard_reset():
+    # 1) 提前計算新的 nonce
+    new_nonce = int(st.session_state.get("ui_nonce", 0)) + 1
+    # 2) 清除 URL 參數
+    try:
+        for k in list(st.query_params.keys()):
+            del st.query_params[k]
+    except Exception:
+        pass
+    # 3) 清除快取（可選）
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    # 4) 清除所有 session，再放回新的 nonce
+    st.session_state.clear()
+    st.session_state["ui_nonce"] = new_nonce
+    # 5) 重新執行
+    st.rerun()
 
-# 輸入區
-st.subheader("輸入查詢資訊")
-origin_q = st.text_input("出發地（A）", key=origin_key)
-dest_q   = st.text_input("目的地（B）", key=dest_key)
-mode_label = st.selectbox("交通方式", ["機車","汽車","腳踏車","大眾運輸","走路"], index=0, key=mode_key)
+# 產生帶 nonce 的 key（避免瀏覽器或 widget 回填）
+nonce = st.session_state["ui_nonce"]
+
+def k(name: str) -> str:
+    return f"{name}_{nonce}"
+
+# ======================== 地理/路線 ========================
+
+def geocode(query: str):
+    if not GOOGLE_MAPS_API_KEY: return None, None, (None, None)
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"address": query, "key": GOOGLE_MAPS_API_KEY, "language": "zh-TW", "region": "tw", "components": "country:TW"}
+    resp = requests.get(url, params=params, timeout=20).json()
+    if resp.get("status") == "OK" and resp.get("results"):
+        top = resp["results"][0]
+        loc = top.get("geometry", {}).get("location", {})
+        lat, lon = loc.get("lat"), loc.get("lng")
+        return f"place_id:{top['place_id']}", top.get("formatted_address", query), (lat, lon)
+    return None, None, (None, None)
+
+
+def get_routes_from_place_ids(origin_pid: str, dest_pid: str, *, mode: str = "driving", avoid: str | None = None, max_routes: int = 3):
+    url = "https://maps.googleapis.com/maps/api/directions/json"
+    params = {
+        "origin": origin_pid,
+        "destination": dest_pid,
+        "mode": mode,
+        "alternatives": "true",
+        "key": GOOGLE_MAPS_API_KEY,
+        "language": "zh-TW",
+        "region": "tw",
+    }
+    if mode == "transit":
+        params["departure_time"] = "now"
+    if avoid:
+        params["avoid"] = avoid  # e.g. "highways"
+    resp = requests.get(url, params=params, timeout=30).json()
+    if resp.get("status") != "OK":
+        return []
+    routes = []
+    for r in resp.get("routes", [])[:max_routes]:
+        coords = polyline.decode(r["overview_polyline"]["points"])
+        leg = r["legs"][0]
+        routes.append((coords, leg["duration"]["value"], leg["distance"]["value"], leg["start_address"], leg["end_address"]))
+    return routes
+
+
+def get_one_route_coords(origin_pid: str, dest_pid: str, *, mode: str = "driving", avoid: str | None = None):
+    rs = get_routes_from_place_ids(origin_pid, dest_pid, mode=mode, avoid=avoid, max_routes=1)
+    return rs[0][0] if rs else []
+
+# ======================== 氣象 ========================
+
+def round_to_hour(dt: datetime) -> datetime:
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def ow_current(lat, lon):
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"}
+    resp = requests.get(url, params=params, timeout=20).json()
+    if "weather" not in resp: return ("查詢失敗", False, 0.0, 0)
+    weather = resp["weather"][0]
+    desc = weather.get("description", "") or "無資料"
+    ow_code = int(weather.get("id") or 0)
+    rain_mm = 0.0
+    if isinstance(resp.get("rain"), dict):
+        rain_mm = float(resp["rain"].get("1h") or resp["rain"].get("3h") or 0.0)
+    is_rain = (rain_mm > OPEN_WEATHER_MIN_RAIN_MM) or ("雨" in desc) or ("雷" in desc) or ("rain" in desc.lower())
+    return desc, is_rain, rain_mm, ow_code
+
+
+def om_hourly_now_prob_precip_code(lat, lon):
+    base = "https://api.open-meteo.com/v1/forecast"
+    params = {"latitude": lat, "longitude": lon, "current": "temperature_2m",
+              "hourly": "time,precipitation,precipitation_probability,weather_code",
+              "forecast_days": 1, "timezone": "auto"}
+    resp = requests.get(base, params=params, timeout=20).json()
+    hourly = resp.get("hourly", {}) or {}
+    times = hourly.get("time", []) or []
+    precs = hourly.get("precipitation", []) or []
+    probs = hourly.get("precipitation_probability", []) or []
+    codes = hourly.get("weather_code", []) or []
+    tz_offset_minutes = int((resp.get("utc_offset_seconds") or 0) / 60)
+
+    now = datetime.now(timezone(timedelta(minutes=tz_offset_minutes)))
+    target = round_to_hour(now).strftime("%Y-%m-%dT%H:00")
+    idx = 0
+    for i, t in enumerate(times):
+        if str(t).startswith(target):
+            idx = i; break
+
+    now_prec = float(precs[idx] if idx < len(precs) else 0.0)
+    now_prob = int(probs[idx] if idx < len(probs) else 0)
+    now_code = int(codes[idx] if idx < len(codes) else 0)
+    next_prec = float(precs[idx+1] if (idx+1) < len(precs) else 0.0)
+    return now_prec, now_prob, now_code, next_prec
+
+# ---------- 2km 格網鍵 + 快取 ----------
+
+def _grid_key(lat, lon, step=0.02):
+    return (round(lat/step)*step, round(lon/step)*step)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _ow_current_cached(lat, lon): return ow_current(lat, lon)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _om_hourly_cached(lat, lon): return om_hourly_now_prob_precip_code(lat, lon)
+
+
+def get_weather_bundle(lat, lon):
+    glat, glon = _grid_key(lat, lon)
+    ow_desc, ow_now, ow_mm, ow_code = _ow_current_cached(glat, glon)
+    om_now_prec, om_prob, om_code, om_next_prec = _om_hourly_cached(glat, glon)
+    mm_measured = max(float(ow_mm or 0.0), float(om_now_prec or 0.0))
+    mm_est = max(mm_measured, float(om_next_prec or 0.0))
+    return {"ow_desc": ow_desc, "ow_now": ow_now, "ow_code": ow_code,
+            "om_prob": om_prob, "om_code": om_code, "mm_est": mm_est}
+
+# ======================== 分析與地圖 ========================
+
+def sample_coords(coords, n_points):
+    if len(coords) <= 2:
+        return coords
+    step = max(1, int(len(coords)/n_points))
+    pts = coords[::step]
+    if pts and pts[-1] != coords[-1]:
+        pts[-1] = coords[-1]
+    return pts
+
+
+def analyze_route(coords, n_points):
+    samples = sample_coords(coords, n_points)
+    segments, cur_state, cur_pts = [], None, []
+    rainy_cnt, mm_sum = 0, 0.0
+    for (lat, lon) in samples:
+        b = get_weather_bundle(lat, lon)
+        mm = float(b["mm_est"])
+        is_rain = (mm > 0.0) or (95 <= b["om_code"] <= 99)
+        mm_sum += mm
+        if is_rain:
+            rainy_cnt += 1
+        if cur_state is None:
+            cur_state, cur_pts = is_rain, [(lat, lon)]
+        elif is_rain == cur_state:
+            cur_pts.append((lat, lon))
+        else:
+            if len(cur_pts) >= 2:
+                segments.append((cur_state, polyline.encode(cur_pts)))
+            cur_state, cur_pts = is_rain, [(lat, lon)]
+    if len(cur_pts) >= 2:
+        segments.append((cur_state, polyline.encode(cur_pts)))
+
+    rain_ratio = (rainy_cnt/len(samples)) if samples else 0.0
+    avg_mm = (mm_sum/len(samples)) if samples else 0.0
+    score = RAIN_RATIO_WEIGHT*rain_ratio + RAIN_INTENSITY_WEIGHT*(avg_mm/30.0)
+    return segments, rain_ratio, avg_mm, score
+
+
+def need_map_for_route(origin_pid, dest_pid, mode, avoid) -> bool:
+    # 先看目的地
+    _, _, (dlat, dlon) = geocode(dest_q)
+    B = get_weather_bundle(dlat, dlon)
+    if (B["mm_est"] >= 0.2) or (B["om_prob"] >= 50) or (95 <= B["om_code"] <= 99):
+        return True
+    # 快掃沿途
+    coords = get_one_route_coords(origin_pid, dest_pid, mode=mode, avoid=avoid)
+    if not coords:
+        return False
+    for (lat, lon) in sample_coords(coords, SAMPLES_FAST):
+        b = get_weather_bundle(lat, lon)
+        risk = max(b["om_prob"]/100.0, 0.6 if b["mm_est"] >= 0.2 else 0.0, 0.8 if 95 <= b["om_code"] <= 99 else 0.0)
+        if risk >= SHOW_MAP_RISK_THRESHOLD:
+            return True
+    return False
+
+
+def build_static_map_url(best_coords, other_coords_list, origin_latlon, dest_latlon, n_points=SAMPLES_NORMAL, size=(640,640), scale=2):
+    base = "https://maps.googleapis.com/maps/api/staticmap"
+    params = {"size": f"{size[0]}x{size[1]}", "scale": str(scale), "language": "zh-TW", "key": GOOGLE_MAPS_API_KEY}
+    query = []
+    # 其他候選：灰色基底 + 藍色雨段
+    for coords in other_coords_list:
+        enc_all = polyline.encode(coords)
+        query.append(("path", f"weight:3|color:{COLOR_GRAY}|enc:{enc_all}"))
+        segs, *_ = analyze_route(coords, n_points)
+        for is_rain, enc in segs:
+            if is_rain:
+                query.append(("path", f"weight:6|color:{COLOR_BLUE}|enc:{enc}"))
+    # 推薦：無雨段綠、雨段藍
+    segs, *_ = analyze_route(best_coords, n_points)
+    for is_rain, enc in segs:
+        color = COLOR_BLUE if is_rain else COLOR_GREEN
+        query.append(("path", f"weight:7|color:{color}|enc:{enc}"))
+    # A/B
+    query.append(("markers", f"color:green|label:A|{origin_latlon[0]},{origin_latlon[1]}"))
+    query.append(("markers", f"color:red|label:B|{dest_latlon[0]},{dest_latlon[1]}"))
+    for k2,v2 in params.items(): query.append((k2,v2))
+    return base + "?" + urlencode(query, doseq=True, quote_via=quote_plus)
+
+# ======================== 介面 ========================
+origin_q = st.text_input("出發地（A）", key=k("origin_q"), placeholder="輸入出發地")
+dest_q   = st.text_input("目的地（B）", key=k("dest_q"),   placeholder="輸入目的地")
+mode_label = st.selectbox("交通方式", ["機車","汽車","腳踏車","大眾運輸","走路"], index=0, key=k("mode"))
 mode = {"機車":"driving","汽車":"driving","腳踏車":"bicycling","大眾運輸":"transit","走路":"walking"}[mode_label]
+avoid = "highways" if mode_label == "機車" else None  # 機車盡量避開國道/快速道路
 
-# 查詢
-if st.button("查詢"):
+# ======================== 查詢 ========================
+if st.button("查詢", key=k("do_query")):
     if not origin_q or not dest_q:
         st.warning("請輸入出發地與目的地"); st.stop()
+    if not GOOGLE_MAPS_API_KEY or not OPENWEATHER_API_KEY:
+        st.error("⚠️ 請先在 `.env` 設定 GOOGLE_MAPS_API_KEY 與 OPENWEATHER_API_KEY"); st.stop()
 
     with st.spinner("解析地點中…"):
-        origin_pid, _ = resolve_place(origin_q)
-        if not origin_pid: st.error("無法識別出發地"); st.stop()
-        dest_pid, _ = resolve_place(dest_q)
-        if not dest_pid: st.error("無法識別目的地"); st.stop()
+        origin_pid, _origin_label, (olat, olon) = geocode(origin_q)
+        dest_pid, _dest_label, (dlat, dlon) = geocode(dest_q)
+        if not origin_pid or not dest_pid:
+            st.error("無法識別出發地或目的地"); st.stop()
 
-    try:
-        with st.spinner("規劃路線中…"):
-            coords, duration_sec, _, origin_label_full, dest_label_full = \
-                get_route_from_place_ids(origin_pid, dest_pid, mode)
-    except Exception as e:
-        st.error(str(e)); st.stop()
+    # 目的地天氣（先顯示）
+    B = get_weather_bundle(dlat, dlon)
+    # 簡化顯示：無降雨顯示綠框陰/多雲/晴；有雨顯示降雨等級與機率
+    # （沿用原本判定規則）
+    def classify_phrase_and_icon(mm: float, prob: int, code_now: int):
+        if (prob < 10) and (mm < 0.2) and not (95 <= code_now <= 99):
+            return "☁️ 無降雨", "無降雨"
+        if 95 <= code_now <= 99: return "⛈️ 雷陣雨", "雷陣雨"
+        if mm >= 30: return "🌧️ 豪雨", "豪雨"
+        if mm >= 15: return "🌧️ 大雨", "大雨"
+        if mm >= 7:  return "🌦️ 陣雨（較大）", "陣雨（較大）"
+        if mm >= 2:  return "🌦️ 陣雨", "陣雨"
+        if mm > 0:   return "🌦️ 短暫陣雨", "短暫陣雨"
+        if prob >= 50: return "☁️ 短暫陣雨（可能）", "短暫陣雨（可能）"
+        return "☁️ 無降雨", "無降雨"
 
-    total_min = int(round(duration_sec / 60))
-    st.subheader("查詢結果")
-    st.write(f"**路線**：{origin_label_full} → {dest_label_full}（{mode_label}）")
-    st.write(f"**預估行程時間**：{total_min} 分鐘")
+    def sky_icon_and_label(desc: str):
+        d = (desc or "").lower()
+        if "overcast" in d or "陰" in d:
+            return "☁️", "陰天"
+        elif "cloud" in d or "雲" in d:
+            return "🌤️", "多雲"
+        else:
+            return "☀️", "天氣晴"
 
-    # 沿途天氣（行政區｜路名）
-    st.subheader("沿途天氣檢查")
-    if duration_sec <= 15*60: n_points = 6
-    elif duration_sec <= 30*60: n_points = 9
-    elif duration_sec <= 60*60: n_points = 12
-    else: n_points = MAX_SAMPLE_POINTS
+    icon_text_B, B_phrase = classify_phrase_and_icon(B["mm_est"], B["om_prob"], B["om_code"])
 
-    step = max(1, int(len(coords) / n_points))
-    sample_points = coords[::step]
-    if sample_points[-1] != coords[-1]:
-        sample_points[-1] = coords[-1]
-
-    rainy_labels, seen = [], set()
-    for (lat, lon) in sample_points:
-        if is_rain_now_consensus(lat, lon):
-            label = reverse_geocode_district_and_road(lat, lon)
-            if label not in seen:
-                seen.add(label); rainy_labels.append(label)
-
-    if rainy_labels:
-        st.error("沿途下雨區域：\n- " + "\n- ".join(rainy_labels))
-    else:
-        st.success("沿途多半無雨。")
-
-    # 目的地天氣（文字用語 + 機率 + 雨量 + 何時雨停）
     st.subheader("目的地天氣")
-    dest_lat, dest_lon = coords[-1]
-
-    # 即時雨量與機率
-    _, ow_now, ow_mm = ow_current(dest_lat, dest_lon)
-    try:
-        om_now, prob_next, om_mm, code_now = om_now_prob_precip_code(dest_lat, dest_lon)
-    except Exception:
-        om_now, prob_next, om_mm, code_now = (False, 0, 0.0, 0)
-
-    mm_est = max(float(ow_mm or 0.0), float(om_mm or 0.0))
-    phrase = classify_rain_phrase(mm_est, prob_next, code_now)
-    now_rain = (phrase != "無降雨" and not phrase.endswith("（可能）")) or ow_now or om_now
-
-    # 預估雨停
-    rain_stop_hours = ow_forecast_rain_stop_hours(dest_lat, dest_lon)
-
-    if now_rain or phrase.startswith("短暫陣雨"):
-        st.error(f"抵達時段：{phrase}")
-        st.write(f"**降雨機率**：{prob_next}%")
-        st.write(f"**雨量**：約 {mm_est:.1f} mm/h")
-        if rain_stop_hours:
-            st.write(f"**預估雨停時間**：約 {rain_stop_hours} 小時後")
+    if B_phrase == "無降雨":
+        icon, label = sky_icon_and_label(B["ow_desc"])
+        st.success(f"{icon} {label}")
     else:
-        st.success(f"抵達時段：{phrase}")
+        st.error(f"{icon_text_B}　降雨機率 {B['om_prob']}%")
+        if (B["mm_est"] >= 0.2) or (B["om_prob"] >= 50) or (95 <= B["om_code"] <= 99):
+            st.write(f"估計雨量：{B['mm_est']:.1f} mm/h")
 
-    st.session_state.query_done = True
+    # 是否需要畫地圖
+    need_map = (B_phrase != "無降雨")
+    if not need_map:
+        coords = get_one_route_coords(origin_pid, dest_pid, mode=mode, avoid=avoid)
+        if coords:
+            for (lat, lon) in sample_coords(coords, SAMPLES_FAST):
+                b = get_weather_bundle(lat, lon)
+                risk = max(b["om_prob"]/100.0, 0.6 if b["mm_est"] >= 0.2 else 0.0, 0.8 if 95 <= b["om_code"] <= 99 else 0.0)
+                if risk >= SHOW_MAP_RISK_THRESHOLD:
+                    need_map = True; break
 
-# 單一重置鍵（確保 key 改變）
-if st.session_state.query_done:
+    if need_map:
+        with st.spinner("規劃路線與繪圖中…"):
+            routes = get_routes_from_place_ids(origin_pid, dest_pid, mode=mode, avoid=avoid, max_routes=3)
+            if routes:
+                scored = []
+                for (coords, dur, dist, _, _) in routes:
+                    _segs, _rr, _mm, score = analyze_route(coords, SAMPLES_NORMAL)
+                    scored.append({"coords": coords, "duration": dur, "distance": dist, "score": score})
+                best = sorted(scored, key=lambda x: (round(x["score"], 4), x["duration"]))[0]["coords"]
+                others = [r["coords"] for r in scored if r["coords"] is not best]
+
+                url = build_static_map_url(
+                    best_coords=best,
+                    other_coords_list=others,
+                    origin_latlon=(olat, olon),
+                    dest_latlon=(dlat, dlon),
+                    n_points=SAMPLES_NORMAL, size=(640,640), scale=2
+                )
+                st.image(url, caption="藍色：有雨路段｜綠色：推薦路線之無雨段｜灰色：其他候選基底線")
+
+    st.session_state["result_ready"] = True
+
+# ======================== 重置 ========================
+if st.session_state.get("result_ready"):
     st.markdown("---")
-    if st.button("重置"):
-        st.session_state.reset_seed = st.session_state.get("reset_seed", 0) + 1
-        for k in list(st.session_state.keys()):
-            if k != "reset_seed":
-                del st.session_state[k]
-        st.rerun()
+    cols = st.columns([1,3])
+    with cols[0]:
+        if st.button("重置", key=k("do_reset")):
+            hard_reset()
