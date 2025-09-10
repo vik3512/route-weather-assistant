@@ -129,7 +129,7 @@ def ow_current(lat, lon):
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"}
     resp = requests.get(url, params=params, timeout=20).json()
-    if "weather" not in resp: return ("查詢失敗", False, 0.0, 0)
+    if "weather" not in resp: return ("查詢失敗", False, 0.0, 0, None)
     weather = resp["weather"][0]
     desc = weather.get("description", "") or "無資料"
     ow_code = int(weather.get("id") or 0)
@@ -137,40 +137,85 @@ def ow_current(lat, lon):
     if isinstance(resp.get("rain"), dict):
         rain_mm = float(resp["rain"].get("1h") or resp["rain"].get("3h") or 0.0)
     is_rain = (rain_mm > OPEN_WEATHER_MIN_RAIN_MM) or ("雨" in desc) or ("雷" in desc) or ("rain" in desc.lower())
-    return desc, is_rain, rain_mm, ow_code
+    ow_temp = None
+    try:
+        ow_temp = float(((resp.get("main") or {}).get("temp")))
+    except Exception:
+        ow_temp = None
+    return desc, is_rain, rain_mm, ow_code, ow_temp
+
+
 
 
 def om_hourly_now_prob_precip_code(lat, lon):
     base = "https://api.open-meteo.com/v1/forecast"
-    params = {"latitude": lat, "longitude": lon, "current": "temperature_2m",
-              "hourly": "time,precipitation,precipitation_probability,weather_code",
-              "forecast_days": 1, "timezone": "auto"}
+    params = {
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m",
+        "hourly": "time,precipitation,precipitation_probability,weather_code",
+        "forecast_days": 1, "timezone": "auto"
+    }
     resp = requests.get(base, params=params, timeout=20).json()
     hourly = resp.get("hourly", {}) or {}
     times = hourly.get("time", []) or []
     precs = hourly.get("precipitation", []) or []
     probs = hourly.get("precipitation_probability", []) or []
     codes = hourly.get("weather_code", []) or []
-    tz_offset_minutes = int((resp.get("utc_offset_seconds") or 0) / 60)
+    cur_temp = None
+    try:
+        cur_temp = float((resp.get("current") or {}).get("temperature_2m"))
+    except Exception:
+        cur_temp = None
 
+    tz_offset_minutes = int((resp.get("utc_offset_seconds") or 0) / 60)
     now = datetime.now(timezone(timedelta(minutes=tz_offset_minutes)))
     target = round_to_hour(now).strftime("%Y-%m-%dT%H:00")
+
+    # 找到「現在」對應的 hourly 索引
     idx = 0
-    for i, t in enumerate(times):
-        if str(t).startswith(target):
-            idx = i; break
+    try:
+        idx = times.index(target)
+    except ValueError:
+        # 找不到就退而求其次，用最接近中間的那個時段
+        if times:
+            idx = min(len(times)-1, max(0, len(times)//2))
+        else:
+            idx = 0
 
-    now_prec = float(precs[idx] if idx < len(precs) else 0.0)
-    now_prob = int(probs[idx] if idx < len(probs) else 0)
-    now_code = int(codes[idx] if idx < len(codes) else 0)
-    next_prec = float(precs[idx+1] if (idx+1) < len(precs) else 0.0)
-    return now_prec, now_prob, now_code, next_prec
+    # 目前值＋下一小時降水
+    now_prec = float(precs[idx]) if idx < len(precs) else 0.0
+    now_prob = int(probs[idx]) if idx < len(probs) else 0
+    now_code = int(codes[idx]) if idx < len(codes) else 0
+    next_prec = float(precs[idx+1]) if (idx+1) < len(precs) else 0.0
 
-# ---------- 2km 格網鍵 + 快取 ----------
+    # 預估雨停時間（僅用 open-meteo hourly）
+    def _is_rain_code(c: int) -> bool:
+        # open-meteo WMO code: drizzle 51-57, rain 61-67, showers 80-82, thunder 95-99
+        return (51 <= c <= 57) or (61 <= c <= 67) or (80 <= c <= 82) or (95 <= c <= 99)
 
-def _grid_key(lat, lon, step=0.02):
+    stop_time = None
+    if now_prec > 0.0 or _is_rain_code(now_code):
+        for j in range(idx+1, len(times)):
+            p = float(precs[j]) if j < len(precs) else 0.0
+            pr = int(probs[j]) if j < len(probs) else 0
+            c = int(codes[j]) if j < len(codes) else 0
+            # 視為停雨的條件：降水量 ~ 0 且 機率 < 30 且 非雨天氣碼
+            if (p <= 0.0) and (pr < 30) and (not _is_rain_code(c)):
+                # times[j] already local time "YYYY-MM-DDTHH:00"
+                try:
+                    stop_time = times[j][11:16]  # "HH:MM"
+                except Exception:
+                    stop_time = None
+                break
+
+    return now_prec, now_prob, now_code, next_prec, cur_temp, stop_time
+
+
+
+
+def _grid_key(lat: float, lon: float, step: float = 0.02):
+    """Quantize lat/lon to a small grid to improve cache hits and reduce API calls."""
     return (round(lat/step)*step, round(lon/step)*step)
-
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _ow_current_cached(lat, lon): return ow_current(lat, lon)
@@ -180,14 +225,27 @@ def _ow_current_cached(lat, lon): return ow_current(lat, lon)
 def _om_hourly_cached(lat, lon): return om_hourly_now_prob_precip_code(lat, lon)
 
 
+
 def get_weather_bundle(lat, lon):
     glat, glon = _grid_key(lat, lon)
-    ow_desc, ow_now, ow_mm, ow_code = _ow_current_cached(glat, glon)
-    om_now_prec, om_prob, om_code, om_next_prec = _om_hourly_cached(glat, glon)
+    ow_desc, ow_now, ow_mm, ow_code, ow_temp = _ow_current_cached(glat, glon)
+    om_now_prec, om_prob, om_code, om_next_prec, om_temp, om_stop = _om_hourly_cached(glat, glon)
     mm_measured = max(float(ow_mm or 0.0), float(om_now_prec or 0.0))
     mm_est = max(mm_measured, float(om_next_prec or 0.0))
-    return {"ow_desc": ow_desc, "ow_now": ow_now, "ow_code": ow_code,
-            "om_prob": om_prob, "om_code": om_code, "mm_est": mm_est}
+    return {"ow_desc": ow_desc, "ow_now": ow_now, "ow_code": ow_code, "om_prob": om_prob, "om_code": om_code, "mm_est": mm_est, "temp": (om_temp if om_temp is not None else ow_temp), "next_mm": om_next_prec, "stop_time": om_stop}
+
+
+def _rainfall_label(mm: float) -> str:
+    try:
+        v = float(mm or 0.0)
+    except Exception:
+        v = 0.0
+    if v >= 50: return "豪大雨"
+    if v >= 30: return "豪雨"
+    if v >= 15: return "大雨"
+    if v >= 7:  return "中雨"
+    if v > 0:   return "小雨"
+    return ""
 
 # ======================== 分析與地圖 ========================
 
@@ -290,79 +348,97 @@ if st.button("查詢", key=k("do_query")):
         if not origin_pid or not dest_pid:
             st.error("無法識別出發地或目的地"); st.stop()
 
-    # 目的地天氣（先顯示）
-    B = get_weather_bundle(dlat, dlon)
-    # 簡化顯示：無降雨顯示綠框陰/多雲/晴；有雨顯示降雨等級與機率
-    # （沿用原本判定規則）
-    def classify_phrase_and_icon(mm: float, prob: int, code_now: int):
-        if (prob < 10) and (mm < 0.2) and not (95 <= code_now <= 99):
+        # 目的地當前天氣（更新樣式與文案）
+        st.subheader("目的地當前天氣")
+        B = get_weather_bundle(dlat, dlon)
+
+        def classify_phrase_and_icon(mm: float, prob: int, code_now: int):
+            if (prob < 10) and (mm < 0.2) and not (95 <= code_now <= 99):
+                return "☁️ 無降雨", "無降雨"
+            if 95 <= code_now <= 99: return "⛈️ 雷陣雨", "雷陣雨"
+            if mm >= 30: return "🌧️ 豪雨", "豪雨"
+            if mm >= 15: return "🌧️ 大雨", "大雨"
+            if mm >= 7:  return "🌦️ 陣雨（較大）", "陣雨（較大）"
+            if mm >= 2:  return "🌦️ 陣雨", "陣雨"
+            if mm > 0:   return "🌦️ 短暫陣雨", "短暫陣雨"
+            if prob >= 50: return "☁️ 短暫陣雨（可能）", "短暫陣雨（可能）"
             return "☁️ 無降雨", "無降雨"
-        if 95 <= code_now <= 99: return "⛈️ 雷陣雨", "雷陣雨"
-        if mm >= 30: return "🌧️ 豪雨", "豪雨"
-        if mm >= 15: return "🌧️ 大雨", "大雨"
-        if mm >= 7:  return "🌦️ 陣雨（較大）", "陣雨（較大）"
-        if mm >= 2:  return "🌦️ 陣雨", "陣雨"
-        if mm > 0:   return "🌦️ 短暫陣雨", "短暫陣雨"
-        if prob >= 50: return "☁️ 短暫陣雨（可能）", "短暫陣雨（可能）"
-        return "☁️ 無降雨", "無降雨"
 
-    def sky_icon_and_label(desc: str):
-        d = (desc or "").lower()
-        if "overcast" in d or "陰" in d:
-            return "☁️", "陰天"
-        elif "cloud" in d or "雲" in d:
-            return "🌤️", "多雲"
+        def sky_icon_and_label(desc: str):
+            d = (desc or "").lower()
+            if "overcast" in d or "陰" in d:
+                return "☁️", "陰天"
+            elif "cloud" in d or "雲" in d:
+                return "🌤️", "多雲"
+            else:
+                return "☀️", "天氣晴"
+
+        icon_text_B, B_phrase = classify_phrase_and_icon(B["mm_est"], B["om_prob"], B["om_code"])
+        temp_text = f"{B['temp']:.1f}°C" if isinstance(B.get("temp"), (int, float)) else "—"
+
+
+
+        if B_phrase == "無降雨":
+            icon, sky_label = sky_icon_and_label(B["ow_desc"])
+            st.success(f"{icon} {sky_label}｜🌡️ {temp_text}｜降雨機率 {B['om_prob']}%")
+            # 下一小時若有雨／雷陣雨／機率偏高 → 提醒
+            try:
+                cond_next    = float(B.get("next_mm") or 0.0) > 0.0
+                cond_thunder = 95 <= int(B.get("om_code", 0)) <= 99
+                cond_prob    = int(B.get("om_prob", 0)) >= 30
+                if cond_next or cond_thunder or cond_prob:
+                    st.info("提醒：可能有午後雷陣雨" if cond_thunder else "提醒：可能有陣雨")
+            except Exception:
+                pass
         else:
-            return "☀️", "天氣晴"
+            st.error(f"{icon_text_B}｜🌡️ {temp_text}｜降雨機率 {B['om_prob']}%")
+            if (B.get("mm_est") or 0) > 0:
+                st.write(f"估計雨量：{B['mm_est']:.1f} mm/h（{_rainfall_label(B['mm_est'])}）")
+            if B.get("stop_time"):
+                st.write(f"預估雨停時間：{B['stop_time']}")
 
-    icon_text_B, B_phrase = classify_phrase_and_icon(B["mm_est"], B["om_prob"], B["om_code"])
+        # 是否需要畫地圖
+        need_map = (B_phrase != "無降雨")
+        if not need_map:
+            coords = get_one_route_coords(origin_pid, dest_pid, mode=mode, avoid=avoid)
+            if coords:
+                for (lat, lon) in sample_coords(coords, SAMPLES_FAST):
+                    b = get_weather_bundle(lat, lon)
+                    risk = max(
+                        b["om_prob"]/100.0,
+                        0.6 if b["mm_est"] >= 0.2 else 0.0,
+                        0.8 if 95 <= b["om_code"] <= 99 else 0.0,
+                    )
+                    if risk >= SHOW_MAP_RISK_THRESHOLD:
+                        need_map = True
+                        break
+        if need_map:
+            st.subheader("路線雨段地圖")
+            with st.spinner("規劃路線與繪圖中…"):
+                routes = get_routes_from_place_ids(origin_pid, dest_pid, mode=mode, avoid=avoid, max_routes=3)
+                if routes:
+                    scored = []
+                    for (coords, dur, dist, _, _) in routes:
+                        _segs, _rr, _mm, score = analyze_route(coords, SAMPLES_NORMAL)
+                        scored.append({"coords": coords, "duration": dur, "distance": dist, "score": score})
+                    best = sorted(scored, key=lambda x: (round(x["score"], 4), x["duration"]))[0]["coords"]
+                    others = [r["coords"] for r in scored if r["coords"] is not best]
 
-    st.subheader("目的地天氣")
-    if B_phrase == "無降雨":
-        icon, label = sky_icon_and_label(B["ow_desc"])
-        st.success(f"{icon} {label}")
-    else:
-        st.error(f"{icon_text_B}　降雨機率 {B['om_prob']}%")
-        if (B["mm_est"] >= 0.2) or (B["om_prob"] >= 50) or (95 <= B["om_code"] <= 99):
-            st.write(f"估計雨量：{B['mm_est']:.1f} mm/h")
+                    url = build_static_map_url(
+                        best_coords=best,
+                        other_coords_list=others,
+                        origin_latlon=(olat, olon),
+                        dest_latlon=(dlat, dlon),
+                        n_points=SAMPLES_NORMAL, size=(640,640), scale=2
+                    )
+                    st.image(url, caption="藍色：有雨路段｜綠色：推薦路線之無雨段｜灰色：其他候選基底線")
 
-    # 是否需要畫地圖
-    need_map = (B_phrase != "無降雨")
-    if not need_map:
-        coords = get_one_route_coords(origin_pid, dest_pid, mode=mode, avoid=avoid)
-        if coords:
-            for (lat, lon) in sample_coords(coords, SAMPLES_FAST):
-                b = get_weather_bundle(lat, lon)
-                risk = max(b["om_prob"]/100.0, 0.6 if b["mm_est"] >= 0.2 else 0.0, 0.8 if 95 <= b["om_code"] <= 99 else 0.0)
-                if risk >= SHOW_MAP_RISK_THRESHOLD:
-                    need_map = True; break
+        st.session_state["result_ready"] = True
 
-    if need_map:
-        with st.spinner("規劃路線與繪圖中…"):
-            routes = get_routes_from_place_ids(origin_pid, dest_pid, mode=mode, avoid=avoid, max_routes=3)
-            if routes:
-                scored = []
-                for (coords, dur, dist, _, _) in routes:
-                    _segs, _rr, _mm, score = analyze_route(coords, SAMPLES_NORMAL)
-                    scored.append({"coords": coords, "duration": dur, "distance": dist, "score": score})
-                best = sorted(scored, key=lambda x: (round(x["score"], 4), x["duration"]))[0]["coords"]
-                others = [r["coords"] for r in scored if r["coords"] is not best]
-
-                url = build_static_map_url(
-                    best_coords=best,
-                    other_coords_list=others,
-                    origin_latlon=(olat, olon),
-                    dest_latlon=(dlat, dlon),
-                    n_points=SAMPLES_NORMAL, size=(640,640), scale=2
-                )
-                st.image(url, caption="藍色：有雨路段｜綠色：推薦路線之無雨段｜灰色：其他候選基底線")
-
-    st.session_state["result_ready"] = True
-
-# ======================== 重置 ========================
-if st.session_state.get("result_ready"):
-    st.markdown("---")
-    cols = st.columns([1,3])
-    with cols[0]:
-        if st.button("重置", key=k("do_reset")):
-            hard_reset()
+    # ======================== 重置 ========================
+    if st.session_state.get("result_ready"):
+        st.markdown("---")
+        cols = st.columns([1,3])
+        with cols[0]:
+            if st.button("重置", key=k("do_reset")):
+                hard_reset()
